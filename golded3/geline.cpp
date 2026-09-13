@@ -60,6 +60,24 @@ struct GoldedAnsiLine
     std::vector<vattr> attr;
 };
 
+// Cursor position, saved cursor, and current color state while rendering
+// one message.  Bundled so the CSI-handling helpers below don't need a
+// long, error-prone list of individual reference parameters.
+struct GoldedAnsiState
+{
+    int row;
+    int col;
+    int saved_row;
+    int saved_col;
+    int maxrow;
+    int fg;
+    int bg;
+    bool intense;
+    vattr curattr;
+};
+
+static const int GOLDED_ANSI_MAX_PARAMS = 32;
+
 static std::vector<GoldedAnsiLine> GoldedAnsiRenderedLines;
 static size_t GoldedAnsiRenderedIndex = 0;
 static bool GoldedAnsiRenderedActive = false;
@@ -222,239 +240,275 @@ static void GoldedAnsiApplySgr(int* vals, int count, int& fg, int& bg, bool& int
     }
 }
 
-static std::string GoldedAnsiRender(const char* src)
+// Parses the ';'-separated numeric parameter list of a CSI sequence
+// (the part between the introducer/'?' and the final command byte).
+// Advances p past the parameters; stops at the command byte.
+static void GoldedAnsiParseCsiParams(const unsigned char*& p, int* vals, int& count, bool& have_value)
 {
-    const int max_width = 255;
-    const int max_rows = 1000;
+    count = 0;
+    for(int nn=0; nn<GOLDED_ANSI_MAX_PARAMS; nn++)
+        vals[nn] = 0;
 
-    GoldedAnsiRenderedLines.clear();
-    GoldedAnsiRenderedIndex = 0;
-    GoldedAnsiRenderedActive = false;
+    have_value = false;
 
-    std::vector<std::string> canvas;
-    std::vector<std::vector<vattr> > attrs;
-    int row = 0;
-    int col = 0;
-    int saved_row = 0;
-    int saved_col = 0;
-    int maxrow = 0;
-    int fg = 7;
-    int bg = 0;
-    bool intense = false;
-    vattr curattr = GoldedAnsiAttr(fg, bg, intense);
-
-    canvas.push_back(std::string());
-    attrs.push_back(std::vector<vattr>());
-
-    for(const unsigned char* p = (const unsigned char*)src; *p;)
+    while(*p)
     {
-        if(GoldedIsAnsiIntro(p))
+        if(isdigit(*p))
         {
-            p += 2;
-
-            bool priv = false;
-            if(*p == '?')
+            int value = 0;
+            while(isdigit(*p))
             {
-                priv = true;
+                value = (value * 10) + (*p - '0');
                 p++;
             }
-
-            int vals[32];
-            int count = 0;
-            for(int nn=0; nn<32; nn++)
-                vals[nn] = 0;
-
-            bool have_value = false;
-
-            while(*p)
+            if(count < GOLDED_ANSI_MAX_PARAMS)
+                vals[count++] = value;
+            have_value = true;
+            if(*p == ';')
             {
-                if(isdigit(*p))
-                {
-                    int value = 0;
-                    while(isdigit(*p))
-                    {
-                        value = (value * 10) + (*p - '0');
-                        p++;
-                    }
-                    if(count < 32)
-                        vals[count++] = value;
-                    have_value = true;
-                    if(*p == ';')
-                    {
-                        p++;
-                        if((*p == ';') and (count < 32))
-                            vals[count++] = 0;
-                        continue;
-                    }
-                    continue;
-                }
-                else if(*p == ';')
-                {
-                    if(count < 32)
-                        vals[count++] = 0;
-                    p++;
-                    continue;
-                }
-                break;
-            }
-
-            unsigned char cmd = *p;
-            if(cmd)
                 p++;
-
-            int n = (have_value and count > 0 and vals[0] > 0) ? vals[0] : 1;
-
-            switch(cmd)
-            {
-            case 'm':
-                GoldedAnsiApplySgr(vals, count, fg, bg, intense);
-                curattr = GoldedAnsiAttr(fg, bg, intense);
-                break;
-
-            case 'C':
-                while(n-- > 0 and col < max_width)
-                {
-                    GoldedAnsiPutChar(canvas, attrs, row, col, ' ', curattr);
-                    col++;
-                }
-                break;
-
-            case 'D':
-                col -= n;
-                if(col < 0)
-                    col = 0;
-                break;
-
-            case 'A':
-                row -= n;
-                if(row < 0)
-                    row = 0;
-                break;
-
-            case 'B':
-                row += n;
-                if(row >= max_rows)
-                    row = max_rows - 1;
-                if(row > maxrow)
-                    maxrow = row;
-                break;
-
-            case 'G':
-                col = (n > 0) ? n - 1 : 0;
-                if(col > max_width)
-                    col = max_width;
-                break;
-
-            case 'H':
-            case 'f':
-                row = (count >= 1 and vals[0] > 0) ? vals[0] - 1 : 0;
-                col = (count >= 2 and vals[1] > 0) ? vals[1] - 1 : 0;
-                if(row < 0)
-                    row = 0;
-                if(col < 0)
-                    col = 0;
-                if(row >= max_rows)
-                    row = max_rows - 1;
-                if(col > max_width)
-                    col = max_width;
-                if(row > maxrow)
-                    maxrow = row;
-                break;
-
-            case 'J':
-                if((count == 0) or vals[0] == 2)
-                {
-                    canvas.clear();
-                    attrs.clear();
-                    canvas.push_back(std::string());
-                    attrs.push_back(std::vector<vattr>());
-                    row = col = saved_row = saved_col = maxrow = 0;
-                }
-                break;
-
-            case 'K':
-                GoldedAnsiEnsureCanvas(canvas, attrs, row, col, curattr);
-                if((int)canvas[row].length() > col)
-                    canvas[row].erase(col);
-                if((int)attrs[row].size() > col)
-                    attrs[row].erase(attrs[row].begin() + col, attrs[row].end());
-                break;
-
-            case 's':
-                saved_row = row;
-                saved_col = col;
-                break;
-
-            case 'u':
-                row = saved_row;
-                col = saved_col;
-                break;
-
-            case 'h':
-            case 'l':
-                (void)priv;
-                break;
-
-            default:
-                break;
+                if((*p == ';') and (count < GOLDED_ANSI_MAX_PARAMS))
+                    vals[count++] = 0;
+                continue;
             }
-
             continue;
         }
-
-        if(*p == '\r')
+        else if(*p == ';')
         {
-            // JAM/Mystic and many BBS messages use CR-only line endings.
-            // Treat CR as a newline; if an LF follows, consume it so CRLF
-            // still advances only one row.
-            row++;
-            col = 0;
-            if(row >= max_rows)
-                row = max_rows - 1;
-            if(row > maxrow)
-                maxrow = row;
-            p++;
-            if(*p == '\n')
-                p++;
-            continue;
-        }
-
-        if(*p == '\n')
-        {
-            row++;
-            col = 0;
-            if(row >= max_rows)
-                row = max_rows - 1;
-            if(row > maxrow)
-                maxrow = row;
+            if(count < GOLDED_ANSI_MAX_PARAMS)
+                vals[count++] = 0;
             p++;
             continue;
         }
+        break;
+    }
+}
 
-        if(*p == '\t')
+// Cursor-movement and position-save/restore CSI commands (C, D, A, B, G,
+// H/f, s, u).  Returns true if cmd was one of these and was handled.
+static bool GoldedAnsiExecCursorCommand(unsigned char cmd,
+                                        const int* vals,
+                                        int count,
+                                        int n,
+                                        GoldedAnsiState& st,
+                                        std::vector<std::string>& canvas,
+                                        std::vector<std::vector<vattr> >& attrs,
+                                        int max_width,
+                                        int max_rows)
+{
+    switch(cmd)
+    {
+    case 'C':
+        while(n-- > 0 and st.col < max_width)
         {
-            int spaces = 8 - (col % 8);
-            while(spaces-- and col < max_width)
-            {
-                GoldedAnsiPutChar(canvas, attrs, row, col, ' ', curattr);
-                col++;
-            }
-            p++;
-            continue;
+            GoldedAnsiPutChar(canvas, attrs, st.row, st.col, ' ', st.curattr);
+            st.col++;
         }
+        return true;
 
-        if(col < max_width)
-        {
-            GoldedAnsiPutChar(canvas, attrs, row, col, (char)*p, curattr);
-            col++;
-        }
+    case 'D':
+        st.col -= n;
+        if(st.col < 0)
+            st.col = 0;
+        return true;
 
-        if(row > maxrow)
-            maxrow = row;
+    case 'A':
+        st.row -= n;
+        if(st.row < 0)
+            st.row = 0;
+        return true;
 
-        p++;
+    case 'B':
+        st.row += n;
+        if(st.row >= max_rows)
+            st.row = max_rows - 1;
+        if(st.row > st.maxrow)
+            st.maxrow = st.row;
+        return true;
+
+    case 'G':
+        st.col = (n > 0) ? n - 1 : 0;
+        if(st.col > max_width)
+            st.col = max_width;
+        return true;
+
+    case 'H':
+    case 'f':
+        st.row = (count >= 1 and vals[0] > 0) ? vals[0] - 1 : 0;
+        st.col = (count >= 2 and vals[1] > 0) ? vals[1] - 1 : 0;
+        if(st.row < 0)
+            st.row = 0;
+        if(st.col < 0)
+            st.col = 0;
+        if(st.row >= max_rows)
+            st.row = max_rows - 1;
+        if(st.col > max_width)
+            st.col = max_width;
+        if(st.row > st.maxrow)
+            st.maxrow = st.row;
+        return true;
+
+    case 's':
+        st.saved_row = st.row;
+        st.saved_col = st.col;
+        return true;
+
+    case 'u':
+        st.row = st.saved_row;
+        st.col = st.saved_col;
+        return true;
     }
 
+    return false;
+}
+
+// Remaining CSI commands: SGR color (m), erase-display (J), erase-to-EOL
+// (K), and the private mode toggles (h/l), which GoldED doesn't act on.
+static void GoldedAnsiExecCsiCommand(unsigned char cmd,
+                                     int* vals,
+                                     int count,
+                                     bool have_value,
+                                     GoldedAnsiState& st,
+                                     std::vector<std::string>& canvas,
+                                     std::vector<std::vector<vattr> >& attrs,
+                                     int max_width,
+                                     int max_rows)
+{
+    int n = (have_value and count > 0 and vals[0] > 0) ? vals[0] : 1;
+
+    if(GoldedAnsiExecCursorCommand(cmd, vals, count, n, st, canvas, attrs, max_width, max_rows))
+        return;
+
+    switch(cmd)
+    {
+    case 'm':
+        GoldedAnsiApplySgr(vals, count, st.fg, st.bg, st.intense);
+        st.curattr = GoldedAnsiAttr(st.fg, st.bg, st.intense);
+        break;
+
+    case 'J':
+        if((count == 0) or vals[0] == 2)
+        {
+            canvas.clear();
+            attrs.clear();
+            canvas.push_back(std::string());
+            attrs.push_back(std::vector<vattr>());
+            st.row = st.col = st.saved_row = st.saved_col = st.maxrow = 0;
+        }
+        break;
+
+    case 'K':
+        GoldedAnsiEnsureCanvas(canvas, attrs, st.row, st.col, st.curattr);
+        if((int)canvas[st.row].length() > st.col)
+            canvas[st.row].erase(st.col);
+        if((int)attrs[st.row].size() > st.col)
+            attrs[st.row].erase(attrs[st.row].begin() + st.col, attrs[st.row].end());
+        break;
+
+    case 'h':
+    case 'l':
+        break;
+
+    default:
+        break;
+    }
+}
+
+// Consumes one full CSI escape sequence starting at p (which must point at
+// the introducer) and applies it to the render state.
+static void GoldedAnsiHandleCsi(const unsigned char*& p,
+                                GoldedAnsiState& st,
+                                std::vector<std::string>& canvas,
+                                std::vector<std::vector<vattr> >& attrs,
+                                int max_width,
+                                int max_rows)
+{
+    p += 2;
+
+    if(*p == '?')
+        p++;
+
+    int vals[GOLDED_ANSI_MAX_PARAMS];
+    int count = 0;
+    bool have_value = false;
+    GoldedAnsiParseCsiParams(p, vals, count, have_value);
+
+    unsigned char cmd = *p;
+    if(cmd)
+        p++;
+
+    GoldedAnsiExecCsiCommand(cmd, vals, count, have_value, st, canvas, attrs, max_width, max_rows);
+}
+
+// Handles one plain (non-CSI) character: CR, LF, tab, or a literal
+// character to place on the canvas.  Advances p past it.
+static void GoldedAnsiAdvanceChar(const unsigned char*& p,
+                                  GoldedAnsiState& st,
+                                  std::vector<std::string>& canvas,
+                                  std::vector<std::vector<vattr> >& attrs,
+                                  int max_width,
+                                  int max_rows)
+{
+    if(*p == '\r')
+    {
+        // JAM/Mystic and many BBS messages use CR-only line endings.
+        // Treat CR as a newline; if an LF follows, consume it so CRLF
+        // still advances only one row.
+        st.row++;
+        st.col = 0;
+        if(st.row >= max_rows)
+            st.row = max_rows - 1;
+        if(st.row > st.maxrow)
+            st.maxrow = st.row;
+        p++;
+        if(*p == '\n')
+            p++;
+        return;
+    }
+
+    if(*p == '\n')
+    {
+        st.row++;
+        st.col = 0;
+        if(st.row >= max_rows)
+            st.row = max_rows - 1;
+        if(st.row > st.maxrow)
+            st.maxrow = st.row;
+        p++;
+        return;
+    }
+
+    if(*p == '\t')
+    {
+        int spaces = 8 - (st.col % 8);
+        while(spaces-- and st.col < max_width)
+        {
+            GoldedAnsiPutChar(canvas, attrs, st.row, st.col, ' ', st.curattr);
+            st.col++;
+        }
+        p++;
+        return;
+    }
+
+    if(st.col < max_width)
+    {
+        GoldedAnsiPutChar(canvas, attrs, st.row, st.col, (char)*p, st.curattr);
+        st.col++;
+    }
+
+    if(st.row > st.maxrow)
+        st.maxrow = st.row;
+
+    p++;
+}
+
+// Trims trailing blank rows and trailing spaces per row, backfills
+// per-character attributes to match, and builds the plain-text return
+// value while stashing the rendered lines in GoldedAnsiRenderedLines.
+static std::string GoldedAnsiFinalizeLines(const std::vector<std::string>& canvas,
+                                           const std::vector<std::vector<vattr> >& attrs,
+                                           int maxrow)
+{
     std::string out;
     int last = MinV(maxrow, (int)canvas.size() - 1);
 
@@ -484,6 +538,42 @@ static std::string GoldedAnsiRender(const char* src)
         out += "\r\n";
     }
 
+    return out;
+}
+
+static std::string GoldedAnsiRender(const char* src)
+{
+    const int max_width = 255;
+    const int max_rows = 1000;
+
+    GoldedAnsiRenderedLines.clear();
+    GoldedAnsiRenderedIndex = 0;
+    GoldedAnsiRenderedActive = false;
+
+    std::vector<std::string> canvas;
+    std::vector<std::vector<vattr> > attrs;
+    canvas.push_back(std::string());
+    attrs.push_back(std::vector<vattr>());
+
+    GoldedAnsiState st;
+    st.row = st.col = st.saved_row = st.saved_col = st.maxrow = 0;
+    st.fg = 7;
+    st.bg = 0;
+    st.intense = false;
+    st.curattr = GoldedAnsiAttr(st.fg, st.bg, st.intense);
+
+    for(const unsigned char* p = (const unsigned char*)src; *p;)
+    {
+        if(GoldedIsAnsiIntro(p))
+        {
+            GoldedAnsiHandleCsi(p, st, canvas, attrs, max_width, max_rows);
+            continue;
+        }
+
+        GoldedAnsiAdvanceChar(p, st, canvas, attrs, max_width, max_rows);
+    }
+
+    std::string out = GoldedAnsiFinalizeLines(canvas, attrs, st.maxrow);
     GoldedAnsiRenderedActive = not GoldedAnsiRenderedLines.empty();
     return out;
 }
