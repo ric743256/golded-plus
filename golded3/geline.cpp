@@ -106,7 +106,7 @@ static bool GoldedHasAnsiCsi(const char* src)
     if(src == NULL)
         return false;
 
-    for(const unsigned char* p = (const unsigned char*)src; *p; p++)
+    for(const unsigned char* p = reinterpret_cast<const unsigned char*>(src); *p; p++)
     {
         if(GoldedIsAnsiIntro(p))
             return true;
@@ -562,7 +562,7 @@ static std::string GoldedAnsiRender(const char* src)
     st.intense = false;
     st.curattr = GoldedAnsiAttr(st.fg, st.bg, st.intense);
 
-    for(const unsigned char* p = (const unsigned char*)src; *p;)
+    for(const unsigned char* p = reinterpret_cast<const unsigned char*>(src); *p;)
     {
         if(GoldedIsAnsiIntro(p))
         {
